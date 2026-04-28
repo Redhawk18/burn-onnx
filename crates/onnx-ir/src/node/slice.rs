@@ -179,37 +179,94 @@ impl NodeProcessor for SliceProcessor {
                 node.outputs[0].ty = input_ty;
             }
             ArgType::Shape(shape_rank) => {
-                // Slicing a Shape extracts a sub-part, resulting in a Shape.
-                // Only static slicing is supported for Shape inputs
-                let (starts, ends, steps) = match (&config.starts, &config.ends, &config.steps) {
+                // Runtime path: output_len cannot be computed without the bound
+                // values, so degrade to a rank-1 i64 tensor.
+                let static_bounds = match (&config.starts, &config.ends, &config.steps) {
                     (SliceInput::Static(s), SliceInput::Static(e), steps_opt) => {
-                        let step_values = match steps_opt {
+                        let steps = match steps_opt {
                             Some(SliceInput::Static(st)) => st.clone(),
-                            _ => vec![1], // Default step is 1
+                            Some(SliceInput::Runtime(_)) => vec![],
+                            None => vec![1],
                         };
-                        (s, e, step_values)
+                        if steps.is_empty() {
+                            None
+                        } else {
+                            Some((s, e, steps))
+                        }
                     }
-                    _ => {
+                    _ => None,
+                };
+
+                if let Some((starts, ends, steps)) = static_bounds {
+                    if starts.len() != 1 || ends.len() != 1 {
                         return Err(ProcessError::Custom(format!(
-                            "Runtime slice on Shape input is not supported for node {}",
+                            "Slice on Shape input requires exactly one dimension slice config for node {}",
                             node.name
                         )));
                     }
-                };
 
-                // Require exactly one dimension for Shape slicing
-                if starts.len() != 1 || ends.len() != 1 {
-                    return Err(ProcessError::Custom(format!(
-                        "Slice on Shape input requires exactly one dimension slice config for node {}",
-                        node.name
-                    )));
+                    let step = if steps.is_empty() { 1 } else { steps[0] };
+                    let output_len = calculate_shape_slice_output_len(
+                        starts[0], ends[0], step, shape_rank, &node.name,
+                    );
+                    node.outputs[0].ty = ArgType::Shape(output_len);
+                } else {
+                    // Enforce single-axis, step=1 invariants up front so the
+                    // codegen can rely on them.
+                    let len_of = |input: &SliceInput| -> Option<usize> {
+                        match input {
+                            SliceInput::Static(v) => Some(v.len()),
+                            SliceInput::Runtime(r) => match &node.inputs[r.input_index].ty {
+                                ArgType::Tensor(t) => t
+                                    .static_shape
+                                    .as_ref()
+                                    .and_then(|s| s.first().copied().flatten()),
+                                ArgType::Shape(n) => Some(*n),
+                                ArgType::ScalarNative(_) | ArgType::ScalarTensor(_) => Some(1),
+                            },
+                        }
+                    };
+                    let mut any_unknown_len = false;
+                    for (which, input) in [("starts", &config.starts), ("ends", &config.ends)] {
+                        match len_of(input) {
+                            Some(n) if n != 1 => {
+                                return Err(ProcessError::Custom(format!(
+                                    "Slice on Shape input requires single-axis slicing; node {} has {} of length {}",
+                                    node.name, which, n
+                                )));
+                            }
+                            None => any_unknown_len = true,
+                            _ => {}
+                        }
+                    }
+                    if any_unknown_len {
+                        log::debug!(
+                            "Slice node {}: runtime bound length not statically known; \
+                             codegen will assert exactly one element at inference time",
+                            node.name
+                        );
+                    }
+                    match &config.steps {
+                        Some(SliceInput::Static(steps)) if steps.iter().any(|&s| s != 1) => {
+                            return Err(ProcessError::Custom(format!(
+                                "Slice on Shape input with runtime bounds only supports step=1; node {} has steps={:?}",
+                                node.name, steps
+                            )));
+                        }
+                        Some(SliceInput::Runtime(_)) => {
+                            return Err(ProcessError::Custom(format!(
+                                "Slice on Shape input with runtime steps is not supported (node {})",
+                                node.name
+                            )));
+                        }
+                        _ => {}
+                    }
+                    node.outputs[0].ty = ArgType::Tensor(crate::ir::TensorType {
+                        dtype: crate::ir::DType::I64,
+                        rank: 1,
+                        static_shape: None,
+                    });
                 }
-
-                let step = if steps.is_empty() { 1 } else { steps[0] };
-                let output_len = calculate_shape_slice_output_len(
-                    starts[0], ends[0], step, shape_rank, &node.name,
-                );
-                node.outputs[0].ty = ArgType::Shape(output_len);
             }
             ArgType::ScalarTensor(dtype) => {
                 // Treat as rank-1 tensor; slicing may change element count
@@ -655,6 +712,68 @@ mod tests {
         // After calling, output should be ArgType::Shape with the calculated length
         // start = 1, end = 3 => output_len = 3 - 1 = 2
         assert!(matches!(&node.outputs[0].ty, ArgType::Shape(2)));
+    }
+
+    #[test]
+    fn test_slice_shape_input_runtime_bounds_degrades_to_tensor() {
+        // Slicing a Shape with runtime starts/ends. Output length cannot be
+        // computed at IR time, so the type degrades to a rank-1 i64 tensor.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "test_slice_shape_runtime")
+            .input_shape("data", 5)
+            .input_tensor_i64("starts", 1, None)
+            .input_tensor_i64("ends", 1, None)
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        let prefs = OutputPreferences::new();
+        processor.infer_types(&mut node, 16, &prefs).unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => {
+                assert_eq!(t.dtype, DType::I64);
+                assert_eq!(t.rank, 1);
+                assert!(t.static_shape.is_none());
+            }
+            other => panic!("Expected Tensor output, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_slice_shape_input_runtime_bounds_length_gt_1_rejected() {
+        // Bounds with a statically known length > 1 cannot work for Shape
+        // slicing (codegen reads element 0 only). Reject early with a clear
+        // error rather than silently producing the wrong slice.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "shape_runtime_len2")
+            .input_shape("data", 5)
+            .input_tensor_i64("starts", 1, Some(vec![2]))
+            .input_tensor_i64("ends", 1, Some(vec![2]))
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        let prefs = OutputPreferences::new();
+        let result = processor.infer_types(&mut node, 16, &prefs);
+        assert!(matches!(result, Err(ProcessError::Custom(ref m)) if m.contains("single-axis")));
+    }
+
+    #[test]
+    fn test_slice_shape_input_runtime_bounds_step_2_rejected() {
+        // The runtime Shape-slice codegen uses an implicit step of 1.
+        // A non-1 step would produce a wrong slice silently, so reject it.
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "shape_runtime_step2")
+            .input_shape("data", 5)
+            .input_tensor_i64("starts", 1, None)
+            .input_tensor_i64("ends", 1, None)
+            .input_tensor_i64_data("axes", vec![0], vec![1])
+            .input_tensor_i64_data("steps", vec![2], vec![1])
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        let prefs = OutputPreferences::new();
+        let result = processor.infer_types(&mut node, 16, &prefs);
+        assert!(matches!(result, Err(ProcessError::Custom(ref m)) if m.contains("step=1")));
     }
 
     #[test]
