@@ -66,38 +66,46 @@ fn normalize_axes(axes: &mut [i64], rank: usize, _node_name: &str) {
     }
 }
 
-/// Calculate output length for slicing a Shape.
-/// Handles negative indices, special cases, and steps.
-fn calculate_shape_slice_output_len(
-    start: i64,
-    end: i64,
-    step: i64,
-    shape_rank: usize,
-    _node_name: &str,
-) -> usize {
-    let shape_len = shape_rank as i64;
+/// Calculate output length for slicing across a dimension.
+///
+/// Follows ONNX/Python semantics: negative indices count from the end, and
+/// out-of-range indices clamp. The ONNX-specific sentinels `i64::MAX` (end with
+/// step > 0, "to end") and `i64::MIN` (end with step < 0, "past first element")
+/// are handled implicitly by clamping — for `step > 0`, `i64::MAX` clamps to
+/// `dim_len`; for `step < 0`, `i64::MIN + dim_len` clamps to `-1`.
+fn calculate_dim_slice_output_len(start: i64, end: i64, step: i64, dim_size: usize) -> usize {
+    if dim_size == 0 {
+        return 0;
+    }
+    let dim_len = dim_size as i64;
 
-    // Normalize negative indices
-    let norm_start = if start < 0 {
-        (shape_len + start).max(0)
+    // Normalize an index: negative values count from the end (idx + dim_len),
+    // then the result is clamped into the valid range for this step direction.
+    fn normalize_index(idx: i64, lo: i64, hi: i64, n: i64) -> i64 {
+        let abs = if idx < 0 { idx + n } else { idx };
+        abs.clamp(lo, hi)
+    }
+
+    // For step > 0, valid endpoints are [0, dim_len]: start at dim_len means
+    // empty slice; end at dim_len means slice to the last element.
+    // For step < 0, start must reference a real index [0, dim_len-1] (we cannot
+    // begin iterating from past the end), and end ranges over [-1, dim_len-1]
+    // where -1 represents the conceptual position before the first element.
+    let (norm_start, norm_end) = if step > 0 {
+        (
+            normalize_index(start, 0, dim_len, dim_len),
+            normalize_index(end, 0, dim_len, dim_len),
+        )
     } else {
-        start.min(shape_len)
+        (
+            normalize_index(start, 0, dim_len - 1, dim_len),
+            normalize_index(end, -1, dim_len - 1, dim_len),
+        )
     };
 
-    // Handle special end values
-    let norm_end = if end == i64::MAX || end >= shape_len {
-        shape_len
-    } else if end < 0 {
-        (shape_len + end).max(0)
-    } else {
-        end.min(shape_len)
-    };
-
-    // Calculate output length considering step
-    let range_len = (norm_end - norm_start).max(0);
-
-    if step.abs() == 1 {
-        range_len as usize
+    let range_len = (norm_end - norm_start) * step.signum();
+    if range_len <= 0 {
+        0
     } else {
         ((range_len + step.abs() - 1) / step.abs()) as usize
     }
@@ -173,10 +181,39 @@ impl NodeProcessor for SliceProcessor {
         let input_ty = node.inputs[0].ty.clone();
 
         match input_ty {
-            ArgType::Tensor(_) => {
-                // Slicing a tensor preserves its type and rank during rank inference.
-                // Shape inference pass will handle the actual shape changes.
-                node.outputs[0].ty = input_ty;
+            ArgType::Tensor(tensor_type) => {
+                // Slice changes dimension sizes along sliced axes. Initialize all dimensions
+                // with sizes from input, then overwrite the axes we can compute statically.
+                let mut static_shape = tensor_type
+                    .static_shape
+                    .clone()
+                    .unwrap_or_else(|| vec![None; tensor_type.rank]);
+
+                if let (
+                    SliceInput::Static(starts),
+                    SliceInput::Static(ends),
+                    Some(SliceInput::Static(axes)),
+                    Some(SliceInput::Static(steps)),
+                ) = (&config.starts, &config.ends, &config.axes, &config.steps)
+                {
+                    for (i, &axis) in axes.iter().enumerate() {
+                        let axis = axis as usize;
+                        if let Some(Some(dim_size)) =
+                            tensor_type.static_shape.as_ref().and_then(|s| s.get(axis))
+                        {
+                            let out_dim = calculate_dim_slice_output_len(
+                                starts[i], ends[i], steps[i], *dim_size,
+                            );
+                            static_shape[axis] = Some(out_dim);
+                        }
+                    }
+                }
+
+                node.outputs[0].ty = ArgType::Tensor(crate::ir::TensorType {
+                    dtype: tensor_type.dtype,
+                    rank: tensor_type.rank,
+                    static_shape: Some(static_shape),
+                });
             }
             ArgType::Shape(shape_rank) => {
                 // Runtime path: output_len cannot be computed without the bound
@@ -206,9 +243,8 @@ impl NodeProcessor for SliceProcessor {
                     }
 
                     let step = if steps.is_empty() { 1 } else { steps[0] };
-                    let output_len = calculate_shape_slice_output_len(
-                        starts[0], ends[0], step, shape_rank, &node.name,
-                    );
+                    let output_len =
+                        calculate_dim_slice_output_len(starts[0], ends[0], step, shape_rank);
                     node.outputs[0].ty = ArgType::Shape(output_len);
                 } else {
                     // Enforce single-axis, step=1 invariants up front so the
@@ -511,6 +547,29 @@ mod tests {
         }
 
         builder
+    }
+
+    fn create_static_shape_slice_node(
+        static_shape: Vec<Option<usize>>,
+        starts: Vec<i64>,
+        ends: Vec<i64>,
+        axes: Vec<i64>,
+        steps: Vec<i64>,
+    ) -> TestNodeBuilder {
+        TestNodeBuilder::new(NodeType::Slice, "test_tensor_slice")
+            .add_input(
+                "data",
+                ArgType::Tensor(crate::ir::TensorType {
+                    dtype: crate::ir::DType::F32,
+                    rank: static_shape.len(),
+                    static_shape: Some(static_shape),
+                }),
+            )
+            .input_tensor_i64_data("starts", starts.clone(), vec![starts.len()])
+            .input_tensor_i64_data("ends", ends.clone(), vec![ends.len()])
+            .input_tensor_i64_data("axes", axes.clone(), vec![axes.len()])
+            .input_tensor_i64_data("steps", steps.clone(), vec![steps.len()])
+            .output_default("output")
     }
 
     fn create_shape_input_node(start: i64, end: i64) -> TestNodeBuilder {
@@ -910,6 +969,256 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_tensor_static_shape_known_dim_filled() {
+        // Slice axis 0: start=2, end=7, step=1
+        let mut node = create_static_shape_slice_node(
+            vec![Some(10), Some(20)],
+            vec![2],
+            vec![7],
+            vec![0],
+            vec![1],
+        )
+        .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(tensor_type) => {
+                let shape = tensor_type.static_shape.as_ref().unwrap();
+                assert_eq!(shape[0], Some(5));
+                assert_eq!(shape[1], Some(20));
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_multi_axis_partial_known() {
+        // Slice axis 0: size=10, start=1, end=6, step=1
+        // Slice axis 2: size=12, start=0, end=12, step=2
+        let mut node = create_static_shape_slice_node(
+            vec![Some(10), Some(5), Some(12)],
+            vec![1, 0],
+            vec![6, 12],
+            vec![0, 2],
+            vec![1, 2],
+        )
+        .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(tensor_type) => {
+                let shape = tensor_type.static_shape.as_ref().unwrap();
+                assert_eq!(shape[0], Some(5));
+                assert_eq!(shape[1], Some(5));
+                assert_eq!(shape[2], Some(6));
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_runtime_inputs_all_none() {
+        // Slice axis 0: size=None, start=None, end=None, step=1
+        let mut node = create_runtime_slice_node().build();
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(tensor_type) => match &tensor_type.static_shape {
+                Some(shape) => {
+                    assert_eq!(shape.len(), 2);
+                    assert!(shape.iter().all(|d| d.is_none()));
+                }
+                None => panic!("Expect tensor static shape"),
+            },
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_end_i64_max_slices_to_end() {
+        // Slice axis 0: size=8, start=3, end=i64::MAX, step=1
+        let mut node = create_static_shape_slice_node(
+            vec![Some(8)],
+            vec![3],
+            vec![i64::MAX],
+            vec![0],
+            vec![1],
+        )
+        .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => {
+                let shape = t.static_shape.as_ref().unwrap();
+                assert_eq!(shape[0], Some(5));
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_end_i64_min_slices_to_start() {
+        // Slice axis 0: dim=8, start=7, end=i64::MIN, step=-1
+        let mut node = create_static_shape_slice_node(
+            vec![Some(8)],
+            vec![7],
+            vec![i64::MIN],
+            vec![0],
+            vec![-1],
+        )
+        .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => {
+                let shape = t.static_shape.as_ref().unwrap();
+                assert_eq!(shape[0], Some(8));
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_negative_step_typical() {
+        // start=7, end=2, step=-1 over dim=10 -> indices 7,6,5,4,3 = 5 elements
+        let mut node =
+            create_static_shape_slice_node(vec![Some(10)], vec![7], vec![2], vec![0], vec![-1])
+                .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => assert_eq!(t.static_shape.as_ref().unwrap()[0], Some(5)),
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_negative_indices() {
+        // start=-3, end=-1, step=1 over dim=10 -> indices 7,8 = 2 elements
+        let mut node =
+            create_static_shape_slice_node(vec![Some(10)], vec![-3], vec![-1], vec![0], vec![1])
+                .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => assert_eq!(t.static_shape.as_ref().unwrap()[0], Some(2)),
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_empty_slice() {
+        // start=5, end=5 with positive step yields a zero-length axis.
+        let mut node =
+            create_static_shape_slice_node(vec![Some(10)], vec![5], vec![5], vec![0], vec![1])
+                .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => assert_eq!(t.static_shape.as_ref().unwrap()[0], Some(0)),
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_static_shape_partial_known_preserves_none() {
+        // Input has a None for axis 1; slicing only axis 0 must keep axis 1 as None.
+        let mut node = create_static_shape_slice_node(
+            vec![Some(10), None, Some(8)],
+            vec![1],
+            vec![6],
+            vec![0],
+            vec![1],
+        )
+        .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => {
+                let shape = t.static_shape.as_ref().unwrap();
+                assert_eq!(shape, &vec![Some(5), None, Some(8)]);
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tensor_no_static_shape_yields_all_none() {
+        // Input has rank but no static_shape; output should be Some(vec![None; rank]).
+        let mut node = create_test_node(vec![1], vec![5], Some(vec![0])).build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        match &node.outputs[0].ty {
+            ArgType::Tensor(t) => {
+                let shape = t.static_shape.as_ref().unwrap();
+                assert_eq!(shape, &vec![None, None, None]);
+            }
+            other => panic!("Expected tensor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shape_input_negative_step() {
+        // Shape slicing with a negative step. Old impl returned 0 here; the
+        // refactored normalization correctly returns 3 (indices 4,3,2).
+        let mut node = TestNodeBuilder::new(NodeType::Slice, "test_shape_neg_step")
+            .input_shape("data", 5)
+            .input_tensor_i64_data("starts", vec![4], vec![1])
+            .input_tensor_i64_data("ends", vec![1], vec![1])
+            .input_tensor_i64_data("axes", vec![0], vec![1])
+            .input_tensor_i64_data("steps", vec![-1], vec![1])
+            .output_default("output")
+            .build_with_graph_data(16);
+
+        let processor = SliceProcessor;
+        processor
+            .infer_types(&mut node, 16, &OutputPreferences::new())
+            .unwrap();
+
+        assert!(matches!(&node.outputs[0].ty, ArgType::Shape(3)));
+    }
+
     // TODO: Missing test for mismatched lengths of starts/ends/axes/steps.
     // ONNX spec requires same length but this isn't tested or validated.
 
@@ -918,15 +1227,6 @@ mod tests {
 
     // TODO: Missing test for out-of-bounds axes after normalization.
     // E.g., for rank-3 tensor, axes=[5] should be invalid even after negative index handling.
-
-    // TODO: Missing test for slicing with negative steps and various start/end combinations.
-    // Negative steps reverse the slice direction, need comprehensive tests for this.
-
-    // TODO: Missing test for empty slice results - when start >= end with positive step.
-    // Should result in zero-size dimension along that axis.
-
-    // TODO: Missing test for INT32_MAX / INT64_MAX special values in ends.
-    // ONNX spec mentions these special values mean "slice to the end" but not tested.
 
     #[test]
     fn test_slice_scalar_tensor_input() {
