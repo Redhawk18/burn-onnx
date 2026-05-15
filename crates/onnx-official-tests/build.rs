@@ -222,10 +222,10 @@ impl Dtype {
 
     /// The concrete Rust element type to use as the type parameter for
     /// `TensorData::assert_approx_eq::<T>`. Matching the source dtype
-    /// avoids two problems: (a) a backend default `FloatElem<TestBackend>`
-    /// that differs from the TensorData dtype would cause a type mismatch,
-    /// and (b) using a narrower type than the decoded values would
-    /// compare at reduced precision.
+    /// avoids two problems: (a) a device-default float dtype that differs
+    /// from the TensorData dtype would cause a type mismatch, and
+    /// (b) using a narrower type than the decoded values would compare
+    /// at reduced precision.
     fn assert_elem_type(self) -> &'static str {
         match self {
             // burn-tensor re-exports `half::f16` / `half::bf16` at its
@@ -336,7 +336,7 @@ fn introspect(model_path: &Path) -> Result<TestMeta, SkipReason> {
 
     // Rank-0 I/O collides with burn's scalar-vs-tensor distinction;
     // burn-onnx may emit `ScalarNative` or `ScalarTensor` instead of
-    // `Tensor<B, 0>` depending on the op, and the harness doesn't yet
+    // `Tensor<0>` depending on the op, and the harness doesn't yet
     // cover that branch. Skip these loudly so we know which tests to
     // come back to.
     if inputs.iter().any(|i| i.rank == 0) || outputs.iter().any(|o| o.rank == 0) {
@@ -813,7 +813,7 @@ fn emit_single_test(buf: &mut String, name: &str, meta: &TestMeta, mode: TestMod
     .unwrap();
     writeln!(
         buf,
-        "    let model = generated::{name}::Model::<TestBackend>::from_file(bpk_path, &device);"
+        "    let model = generated::{name}::Model::from_file(bpk_path, &device);"
     )
     .unwrap();
 
@@ -849,10 +849,10 @@ fn emit_single_test(buf: &mut String, name: &str, meta: &TestMeta, mode: TestMod
         // mutate the test's input dtype.
         writeln!(
             buf,
-            "    let {binding}: burn::tensor::Tensor<TestBackend, {rank}{kind}> = match {binding}_ref.values {{\n\
+            "    let {binding}: burn::tensor::Tensor<{rank}{kind}> = match {binding}_ref.values {{\n\
              \x20       onnx_official_tests::pb_loader::TensorValues::{variant}(values) => {{\n\
              \x20           let data = burn::tensor::TensorData::new(values, {binding}_ref.shape);\n\
-             \x20           burn::tensor::Tensor::<TestBackend, {rank}{kind}>::from_data(data, (&device, {dtype_tokens}))\n\
+             \x20           burn::tensor::Tensor::<{rank}{kind}>::from_data(data, (&device, {dtype_tokens}))\n\
              \x20       }}\n\
              \x20       other => panic!(\"{name} input_{idx}: expected {onnx_name}, got {{}}\", other.dtype_name()),\n\
              \x20   }};"
