@@ -3,6 +3,7 @@ message: "If you use this software, please cite it as below."
 authors:
   - family-names: "Tadjibaev"
     given-names: "Dilshod"
+    email: "dilshod@gmail.com"
   - name: "Burn-Onix Contributors"
 title: "Burn-Onnx"
 version: 0.21.0
